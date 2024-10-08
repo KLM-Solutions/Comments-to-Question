@@ -7,6 +7,7 @@ import json
 from docx import Document
 from io import BytesIO
 from dotenv import load_dotenv
+from collections import defaultdict
 
 load_dotenv()
 
@@ -33,7 +34,7 @@ def get_all_comments(video_id: str):
             response = youtube.commentThreads().list(
                 part='snippet',
                 videoId=video_id,
-                maxResults=100,
+                maxResults=100,  # Maximum allowed by the API
                 pageToken=nextPageToken,
                 order='time'
             ).execute()
@@ -47,6 +48,23 @@ def get_all_comments(video_id: str):
                     'published_at': datetime.strptime(comment['publishedAt'], "%Y-%m-%dT%H:%M:%SZ")
                 })
 
+                # Fetch replies to this comment
+                if item['snippet']['totalReplyCount'] > 0:
+                    replies = youtube.comments().list(
+                        part='snippet',
+                        parentId=item['id'],
+                        maxResults=100  # Maximum allowed by the API
+                    ).execute()
+                    
+                    for reply in replies['items']:
+                        reply_snippet = reply['snippet']
+                        comments.append({
+                            'author': reply_snippet['authorDisplayName'],
+                            'text': reply_snippet['textDisplay'],
+                            'likes': reply_snippet['likeCount'],
+                            'published_at': datetime.strptime(reply_snippet['publishedAt'], "%Y-%m-%dT%H:%M:%SZ")
+                        })
+
             nextPageToken = response.get('nextPageToken')
             if not nextPageToken:
                 break
@@ -56,13 +74,14 @@ def get_all_comments(video_id: str):
         return f"An error occurred while fetching comments: {str(e)}"
 
 def extract_questions(comments, video_info):
-    comments_with_authors = [f"{comment['author']}: {comment['text']} (Date: {comment['published_at'].strftime('%Y-%m-%d %H:%M:%S')})" for comment in comments]
-    all_comments_text = "\n".join(comments_with_authors)
-    
-    prompt = f"""Analyze the following YouTube comments for the video titled "{video_info['title']}" and extract the 4 most relevant direct questions and 4 most relevant indirect questions about the video content. Improve and rephrase the questions to make them more efficient, clear, and insightful.
+    try:
+        comments_with_authors = [f"{comment['author']}: {comment['text']} (Date: {comment['published_at'].strftime('%Y-%m-%d %H:%M:%S')})" for comment in comments]
+        all_comments_text = "\n".join(comments_with_authors[:100])  # Limit to first 100 comments to avoid token limit
+        
+        prompt = f"""Analyze the following YouTube comments for the video titled "{video_info['title']}" and extract the 4 most relevant direct questions and 4 most relevant indirect questions about the video content. Improve and rephrase the questions to make them more efficient, clear, and insightful.
 
 Video Title: {video_info['title']}
-Video Description: {video_info['description']}
+Video Description: {video_info['description'][:500]}  # Limit description length
 
 Comments:
 {all_comments_text}
@@ -90,19 +109,26 @@ Indirect Questions:
 If there are not enough relevant questions in either category, write 'No more relevant questions found.' for the remaining slots.
 """
 
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",  # Using GPT-4 for better accuracy and relevance
-        messages=[
-            {"role": "system", "content": "You are an AI assistant specialized in analyzing YouTube comments and extracting insightful, relevant questions. Your task is to identify, categorize, improve, and limit the number of questions from user comments, ensuring they are directly related to the video content."},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=1000
-    )
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an AI assistant specialized in analyzing YouTube comments and extracting insightful, relevant questions. Your task is to identify, categorize, improve, and limit the number of questions from user comments, ensuring they are directly related to the video content."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1000
+        )
 
-    return response.choices[0].message.content
+        return response.choices[0].message.content
+    except openai.error.InvalidRequestError as e:
+        st.error(f"Error in OpenAI API request: {str(e)}")
+        return "Unable to extract questions due to an API error. This may be due to the length of the input. Try analyzing a video with fewer comments."
+    except Exception as e:
+        st.error(f"An unexpected error occurred: {str(e)}")
+        return "An unexpected error occurred while extracting questions."
 
 def generate_related_questions(questions):
-    prompt = f"""Based on the following extracted questions from YouTube comments, generate a list of 5-10 related questions that could further enhance the discussion about the video content. These related questions should explore themes or topics that are implied by the original questions but not directly asked.
+    try:
+        prompt = f"""Based on the following extracted questions from YouTube comments, generate a list of 5-10 related questions that could further enhance the discussion about the video content. These related questions should explore themes or topics that are implied by the original questions but not directly asked.
 
 Extracted Questions:
 {questions}
@@ -116,16 +142,19 @@ Please provide a list of related questions that:
 Format your response as a numbered list of questions.
 """
 
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are an AI assistant specialized in generating insightful and related questions based on existing questions from YouTube comments."},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=1000
-    )
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an AI assistant specialized in generating insightful and related questions based on existing questions from YouTube comments."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1000
+        )
 
-    return response.choices[0].message.content
+        return response.choices[0].message.content
+    except Exception as e:
+        st.error(f"An error occurred while generating related questions: {str(e)}")
+        return "Unable to generate related questions due to an error."
 
 def get_video_info(video_id):
     try:
@@ -151,31 +180,64 @@ def get_video_info(video_id):
         st.error(f"An error occurred while fetching video info: {str(e)}")
         return None
 
-def analyze_sentiment(comments):
-    positive_words = set(['good', 'great', 'awesome', 'excellent', 'amazing', 'love', 'like', 'best'])
-    negative_words = set(['bad', 'terrible', 'awful', 'worst', 'hate', 'dislike', 'poor'])
-    
-    positive_count = 0
-    negative_count = 0
-    neutral_count = 0
-    
-    for comment in comments:
-        text = comment['text'].lower()
-        if any(word in text for word in positive_words):
-            positive_count += 1
-        elif any(word in text for word in negative_words):
-            negative_count += 1
-        else:
-            neutral_count += 1
-    
-    total = positive_count + negative_count + neutral_count
-    return {
-        'positive': positive_count / total if total > 0 else 0,
-        'negative': negative_count / total if total > 0 else 0,
-        'neutral': neutral_count / total if total > 0 else 0
-    }
+def analyze_comment_sentiment(comment):
+    try:
+        prompt = f"Analyze the sentiment of the following comment and classify it as POSITIVE, NEGATIVE, or NEUTRAL. Respond with only one word: POSITIVE, NEGATIVE, or NEUTRAL.\n\nComment: {comment['text']}"
+        
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a sentiment analysis AI. Classify the given comment as POSITIVE, NEGATIVE, or NEUTRAL."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=10
+        )
+        
+        sentiment = response.choices[0].message.content.strip().upper()
+        return sentiment if sentiment in ["POSITIVE", "NEGATIVE", "NEUTRAL"] else "NEUTRAL"
+    except Exception as e:
+        st.warning(f"Error analyzing sentiment for a comment: {str(e)}")
+        return "NEUTRAL"
 
-def create_docx_report(video_info, comments, questions, related_questions, sentiment):
+def analyze_comments(video_id):
+    if video_id:
+        with st.spinner("📊 Fetching and analyzing comments..."):
+            comments = get_all_comments(video_id)
+            if isinstance(comments, list):
+                st.session_state.comments = comments
+                st.session_state.comments.sort(key=lambda x: x['published_at'], reverse=True)
+                st.session_state.video_info = get_video_info(video_id)
+                
+                if st.session_state.video_info:
+                    st.session_state.questions = extract_questions(comments[:100], st.session_state.video_info)  # Limit to 100 comments
+                    if st.session_state.questions and not st.session_state.questions.startswith("Unable to extract questions"):
+                        st.session_state.related_questions = generate_related_questions(st.session_state.questions)
+                    else:
+                        st.session_state.related_questions = "Unable to generate related questions due to an error in extracting initial questions."
+                else:
+                    st.error("Unable to fetch video information. Please check the video ID and try again.")
+                    return
+
+                # Analyze sentiment for each comment
+                sentiments = defaultdict(list)
+                for comment in comments:
+                    sentiment = analyze_comment_sentiment(comment)
+                    comment['sentiment'] = sentiment
+                    sentiments[sentiment].append(comment)
+                
+                st.session_state.sentiments = dict(sentiments)
+                st.session_state.sentiment_counts = {
+                    'POSITIVE': len(sentiments['POSITIVE']),
+                    'NEGATIVE': len(sentiments['NEGATIVE']),
+                    'NEUTRAL': len(sentiments['NEUTRAL'])
+                }
+                st.session_state.total_comments_analyzed = len(comments)
+            else:
+                st.error(comments)
+    else:
+        st.error("⚠️ Please enter a YouTube Video ID.")
+
+def create_docx_report(video_info, comments, questions, related_questions, sentiment_counts, sentiments):
     doc = Document()
     doc.add_heading('YouTube Video Analysis Report', 0)
 
@@ -189,9 +251,21 @@ def create_docx_report(video_info, comments, questions, related_questions, senti
 
     # Sentiment Analysis
     doc.add_heading('Sentiment Analysis', level=1)
-    doc.add_paragraph(f"Positive: {sentiment['positive']:.2%}")
-    doc.add_paragraph(f"Neutral: {sentiment['neutral']:.2%}")
-    doc.add_paragraph(f"Negative: {sentiment['negative']:.2%}")
+    total_comments = sum(sentiment_counts.values())
+    doc.add_paragraph(f"Total comments analyzed: {total_comments}")
+    doc.add_paragraph(f"Positive: {sentiment_counts['POSITIVE']} ({(sentiment_counts['POSITIVE'] / total_comments) * 100:.2f}%)")
+    doc.add_paragraph(f"Neutral: {sentiment_counts['NEUTRAL']} ({(sentiment_counts['NEUTRAL'] / total_comments) * 100:.2f}%)")
+    doc.add_paragraph(f"Negative: {sentiment_counts['NEGATIVE']} ({(sentiment_counts['NEGATIVE'] / total_comments) * 100:.2f}%)")
+
+    # Add sentiment-specific comments
+    for sentiment in ['POSITIVE', 'NEUTRAL', 'NEGATIVE']:
+        doc.add_heading(f"{sentiment.capitalize()} Comments", level=2)
+        for comment in sentiments[sentiment]:
+            doc.add_paragraph(f"Author: {comment['author']}")
+            doc.add_paragraph(f"Text: {comment['text']}")
+            doc.add_paragraph(f"Likes: {comment['likes']}")
+            doc.add_paragraph(f"Published at: {comment['published_at']}")
+            doc.add_paragraph("---")
 
     # Extracted and Improved Questions
     doc.add_heading('Extracted and Improved Questions', level=1)
@@ -201,32 +275,7 @@ def create_docx_report(video_info, comments, questions, related_questions, senti
     doc.add_heading('Related Questions', level=1)
     doc.add_paragraph(related_questions)
 
-    # Comments
-    doc.add_heading('Comments', level=1)
-    for comment in comments:
-        doc.add_paragraph(f"Author: {comment['author']}")
-        doc.add_paragraph(f"Text: {comment['text']}")
-        doc.add_paragraph(f"Likes: {comment['likes']}")
-        doc.add_paragraph(f"Published at: {comment['published_at']}")
-        doc.add_paragraph("---")
-
     return doc
-
-def analyze_comments(video_id):
-    if video_id:
-        with st.spinner("📊 Fetching and analyzing comments..."):
-            comments = get_all_comments(video_id)
-            if isinstance(comments, list):
-                st.session_state.comments = comments
-                st.session_state.comments.sort(key=lambda x: x['published_at'], reverse=True)
-                st.session_state.video_info = get_video_info(video_id)
-                st.session_state.questions = extract_questions(comments, st.session_state.video_info)
-                st.session_state.related_questions = generate_related_questions(st.session_state.questions)
-                st.session_state.sentiment = analyze_sentiment(comments)
-            else:
-                st.error(comments)
-    else:
-        st.error("⚠️ Please enter a YouTube Video ID.")
 
 st.set_page_config(layout="wide", page_title="Bent's Comment Analyzer 🎥💬")
 
@@ -320,6 +369,13 @@ st.markdown("""
     .sort-button:hover {
         background-color: #27ae60;
     }
+    .summary-box {
+        background-color: #ecf0f1;
+        border-radius: 5px;
+        padding: 10px;
+        margin-bottom: 15px;
+        font-size: 0.9em;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -339,8 +395,12 @@ if 'related_questions' not in st.session_state:
     st.session_state.related_questions = None
 if 'video_info' not in st.session_state:
     st.session_state.video_info = None
-if 'sentiment' not in st.session_state:
-    st.session_state.sentiment = None
+if 'sentiments' not in st.session_state:
+    st.session_state.sentiments = None
+if 'sentiment_counts' not in st.session_state:
+    st.session_state.sentiment_counts = None
+if 'total_comments_analyzed' not in st.session_state:
+    st.session_state.total_comments_analyzed = 0
 
 def toggle_sort_order():
     st.session_state.sort_order = 'oldest' if st.session_state.sort_order == 'newest' else 'newest'
@@ -370,12 +430,56 @@ if st.session_state.video_info:
     with col2:
         st.image(st.session_state.video_info['thumbnail'], use_column_width=True)
 
-if st.session_state.sentiment:
+if 'sentiment_counts' in st.session_state and st.session_state.sentiment_counts:
     st.markdown("## 💭 Sentiment Analysis")
+    
+    # Add summary box
+    st.markdown(f"""
+    <div class="summary-box">
+        Total comments analyzed: {st.session_state.total_comments_analyzed}<br>
+        Positive: {st.session_state.sentiment_counts['POSITIVE']}<br>
+        Neutral: {st.session_state.sentiment_counts['NEUTRAL']}<br>
+        Negative: {st.session_state.sentiment_counts['NEGATIVE']}
+    </div>
+    """, unsafe_allow_html=True)
+    
     col1, col2, col3 = st.columns(3)
-    col1.metric("Positive", f"{st.session_state.sentiment['positive']:.2%}")
-    col2.metric("Neutral", f"{st.session_state.sentiment['neutral']:.2%}")
-    col3.metric("Negative", f"{st.session_state.sentiment['negative']:.2%}")
+    total_comments = sum(st.session_state.sentiment_counts.values())
+    
+    def show_sentiment_comments(sentiment):
+        st.session_state.active_sentiment = sentiment
+    
+    with col1:
+        positive_percentage = (st.session_state.sentiment_counts.get('POSITIVE', 0) / total_comments) * 100 if total_comments else 0
+        st.metric("Positive", f"{positive_percentage:.2f}%")
+        if st.button("Show Positive Comments"):
+            show_sentiment_comments('POSITIVE')
+    
+    with col2:
+        neutral_percentage = (st.session_state.sentiment_counts.get('NEUTRAL', 0) / total_comments) * 100 if total_comments else 0
+        st.metric("Neutral", f"{neutral_percentage:.2f}%")
+        if st.button("Show Neutral Comments"):
+            show_sentiment_comments('NEUTRAL')
+    
+    with col3:
+        negative_percentage = (st.session_state.sentiment_counts.get('NEGATIVE', 0) / total_comments) * 100 if total_comments else 0
+        st.metric("Negative", f"{negative_percentage:.2f}%")
+        if st.button("Show Negative Comments"):
+            show_sentiment_comments('NEGATIVE')
+
+    if 'active_sentiment' in st.session_state and 'sentiments' in st.session_state:
+        st.markdown(f"## {st.session_state.active_sentiment.capitalize()} Comments")
+        for comment in st.session_state.sentiments.get(st.session_state.active_sentiment, []):
+            st.markdown(f"""
+            <div class="comment">
+                <div class="comment-author">👤 {comment['author']}</div>
+                <div class="comment-date">🕒 {comment['published_at'].strftime('%Y-%m-%d %H:%M:%S')}</div>
+                <div class="comment-text">{comment['text']}</div>
+                <div class="comment-likes">❤️ {comment['likes']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+else:
+    st.info("No sentiment analysis data available. Please analyze comments first.")
 
 if st.session_state.comments:
     st.markdown("## 📤 Export Data")
@@ -383,9 +487,9 @@ if st.session_state.comments:
     
     if st.button("Export Data"):
         if export_format == "CSV":
-            csv = "Author,Text,Likes,Published At\n"
+            csv = "Author,Text,Likes,Published At,Sentiment\n"
             for comment in st.session_state.comments:
-                csv += f"{comment['author']},{comment['text'].replace(',', ' ')},{comment['likes']},{comment['published_at']}\n"
+                csv += f"{comment['author']},{comment['text'].replace(',', ' ')},{comment['likes']},{comment['published_at']},{comment.get('sentiment', 'NEUTRAL')}\n"
             st.download_button(
                 label="Download CSV",
                 data=csv,
@@ -395,10 +499,11 @@ if st.session_state.comments:
         elif export_format == "JSON":
             data = {
                 "video_info": st.session_state.video_info,
-                "sentiment": st.session_state.sentiment,
+                "sentiment_counts": st.session_state.sentiment_counts,
                 "questions": st.session_state.questions,
                 "related_questions": st.session_state.related_questions,
-                "comments": st.session_state.comments
+                "comments": st.session_state.comments,
+                "total_comments_analyzed": st.session_state.total_comments_analyzed
             }
             json_str = json.dumps(data, default=str)
             st.download_button(
@@ -413,7 +518,8 @@ if st.session_state.comments:
                 st.session_state.comments,
                 st.session_state.questions,
                 st.session_state.related_questions,
-                st.session_state.sentiment
+                st.session_state.sentiment_counts,
+                st.session_state.sentiments
             )
             bio = BytesIO()
             doc.save(bio)
@@ -470,4 +576,3 @@ if st.session_state.comments:
             st.info("💡 No related questions generated yet. Try analyzing a video to get related questions.")
 
 st.markdown("---")
-st.markdown("Developed with ❤️ using Streamlit")
