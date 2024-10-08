@@ -478,9 +478,7 @@ if 'sentiment_counts' in st.session_state and st.session_state.sentiment_counts:
                 <div class="comment-likes">❤️ {comment['likes']}</div>
             </div>
             """, unsafe_allow_html=True)
-else:
-    st.info("No sentiment analysis data available. Please analyze comments first.")
-
+            
 if st.session_state.comments:
     st.markdown("## 📤 Export Data")
     export_format = st.selectbox("Choose export format:", ["CSV", "JSON", "DOCX"])
